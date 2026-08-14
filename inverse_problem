@@ -1,146 +1,125 @@
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import time
 
-# -------------------- 参数 --------------------
-n = 32
-eps = 0.3
-K_iter = 5
-num_train = 5000
-num_test = 50
-epochs_init = 150
-epochs_per_step = 75
+# -------------------- 参数设置 --------------------
+N = 20
+h = 1.0 / N
+K_iter = 100
+num_train = 200
+num_test = 20
+epochs_init = 20
+epochs_per_step = 10
 lr = 1e-3
+reg_lambda = 1e-5
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# -------------------- 数据生成 --------------------
+# -------------------- 离散化矩阵 A --------------------
+x = torch.linspace(0.5/N, 1-0.5/N, N, device=device)
+A = h * torch.exp(x.unsqueeze(1) * x.unsqueeze(0))
+A_T = A.T
+A_reg = A_T @ A + reg_lambda * torch.eye(N, device=device)
+
+# -------------------- 生成数据（低频光滑解） --------------------
 def generate_data(num_samples):
-    c = torch.rand(num_samples, n, device=device) * 2 - 1
-    u = torch.zeros_like(c)
-    for _ in range(200):
-        u_next = c + eps * torch.sin(torch.cat([u[:, 1:], u[:, :1]], dim=1))
-        u = u_next
-    return c, u
+    coef = torch.randn(num_samples, 4, device=device)
+    y = torch.linspace(0, 1, N, device=device)
+    basis = torch.stack([torch.ones_like(y), y, y**2, y**3], dim=1)
+    phi = coef @ basis.T
+    phi = phi / torch.norm(phi, dim=1, keepdim=True)
+    f = torch.matmul(A, phi.unsqueeze(-1)).squeeze(-1)
+    return f, phi
 
 torch.manual_seed(42)
-c_train, u_train = generate_data(num_train)
-c_test, u_test = generate_data(num_test)
+f_train, phi_train = generate_data(num_train)
+f_test, phi_test = generate_data(num_test)
 
-# -------------------- 基础函数 --------------------
-def shift(u):
-    return torch.cat([u[:, 1:], u[:, :1]], dim=1)
-
-def compute_residual(c, u):
-    return u - c - eps * torch.sin(shift(u))
-
-# ==================== 迭代器类 ====================
-# 1. 固定不动点（无参数）
-class FixedPointIterator(nn.Module):
-    def __init__(self):
+# -------------------- 网络模块 --------------------
+class InitialNet(nn.Module):
+    def __init__(self, n):
         super().__init__()
-        self.register_buffer('eps', torch.tensor(eps, device=device))
+        self.fc = nn.Linear(n, n, bias=True)
 
-    def forward(self, c, u):
-        G = c + self.eps * torch.sin(shift(u))
-        return G  # alpha=1
+    def forward(self, f):
+        return self.fc(f)
 
-# 2. 参数化不动点（可训练 eps_param）
-class ParamFixedPointIterator(nn.Module):
-    def __init__(self, trainable=False):
+class CGStep(nn.Module):
+    def __init__(self, A_reg, trainable=False):
         super().__init__()
+        self.register_buffer('A_reg', A_reg)
+        self.trainable = trainable
         if trainable:
-            self.eps_param = nn.Parameter(torch.full((n,), eps, device=device))
+            self.alpha = nn.Parameter(torch.tensor(1.0, device=A_reg.device))
+            self.beta  = nn.Parameter(torch.tensor(0.0, device=A_reg.device))
+
+    def forward(self, phi, p, b):
+        r = b - phi @ self.A_reg
+        if self.trainable:
+            phi_new = phi + self.alpha * p
+            r_new = b - phi_new @ self.A_reg
+            p_new = r_new + self.beta * p
         else:
-            self.register_buffer('eps_param', torch.full((n,), eps, device=device))
+            r_dot = (r * r).sum(dim=-1, keepdim=True)
+            Ap = p @ self.A_reg
+            pAp = (p * Ap).sum(dim=-1, keepdim=True)
+            alpha = r_dot / (pAp + 1e-12)
+            phi_new = phi + alpha * p
+            r_new = r - alpha * Ap
+            beta = (r_new * r_new).sum(dim=-1, keepdim=True) / (r_dot + 1e-12)
+            p_new = r_new + beta * p
+        return phi_new, p_new, r_new
 
-    def forward(self, c, u):
-        eps_i = self.eps_param.unsqueeze(0)
-        return c + eps_i * torch.sin(shift(u))
-
-# 3. 固定解析牛顿（无参数）
-class AnalyticNewtonIterator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('eps', torch.tensor(eps, device=device))
-
-    def forward(self, c, u):
-        batch = u.size(0)
-        F = compute_residual(c, u)
-        J = torch.zeros(batch, n, n, device=device)
-        for i in range(n):
-            J[:, i, i] = 1.0
-            j = (i + 1) % n
-            J[:, i, j] = -self.eps * torch.cos(u[:, j])
-        delta = torch.linalg.solve(J, -F.unsqueeze(-1)).squeeze(-1)
-        return u + delta
-
-# 4. 参数化牛顿（可训练 diag, offdiag）
-class ParamNewtonIterator(nn.Module):
-    def __init__(self, trainable=False):
-        super().__init__()
-        if trainable:
-            self.diag = nn.Parameter(torch.ones(n, device=device))
-            self.offdiag = nn.Parameter(torch.full((n,), -eps, device=device))
-        else:
-            self.register_buffer('diag', torch.ones(n, device=device))
-            self.register_buffer('offdiag', torch.full((n,), -eps, device=device))
-
-    def forward(self, c, u):
-        batch = u.size(0)
-        F = compute_residual(c, u)
-        J = torch.zeros(batch, n, n, device=device)
-        for i in range(n):
-            J[:, i, i] = self.diag[i]
-            j = (i + 1) % n
-            J[:, i, j] = self.offdiag[i] * torch.cos(u[:, j])
-        delta = torch.linalg.solve(J, -F.unsqueeze(-1)).squeeze(-1)
-        return u + delta
-
-# 5. 固定离散牛顿（无参数）
-# 已删除，改为使用纯展开的对角割线法（见第 6 部分）
-
-# 6. 对角割线法（可训练 inv_diag, rho）
-class DiagonalSecantIterator(nn.Module):
-    def __init__(self, trainable=False):
-        super().__init__()
-        if trainable:
-            self.inv_diag = nn.Parameter(torch.ones(n, device=device))
-            self.rho = nn.Parameter(torch.tensor(1.0, device=device))
-        else:
-            self.register_buffer('inv_diag', torch.ones(n, device=device))
-            self.register_buffer('rho', torch.tensor(1.0, device=device))
-
-    def forward(self, c, u):
-        F = compute_residual(c, u)
-        delta = self.inv_diag * F
-        return u - self.rho * delta
-
-# ==================== GON模型与工具 ====================
-class GONModel(nn.Module):
-    def __init__(self, initial_net, iterators):
+class CGModel(nn.Module):
+    def __init__(self, initial_net, steps, A_reg, A_T):
         super().__init__()
         self.initial = initial_net
-        self.iterators = nn.ModuleList(iterators)
+        self.steps = nn.ModuleList(steps)
+        self.register_buffer('A_reg', A_reg)
+        self.register_buffer('A_T', A_T)
 
-    def forward(self, c):
-        u = self.initial(c)
-        for it in self.iterators:
-            u = it(c, u)
-        return u
+    def forward(self, f):
+        phi = self.initial(f)
+        b = f @ self.A_T.T
+        r = b - phi @ self.A_reg
+        p = r.clone()
+        for step in self.steps:
+            phi, p, r = step(phi, p, b)
+        return phi
 
-def train_model(model, epochs, lr=1e-3):
+# -------------------- Baseline 模型（多层全连接 + ReLU） --------------------
+class BaselineNet(nn.Module):
+    def __init__(self, n, num_extra=0):
+        super().__init__()
+        self.initial = nn.Linear(n, n, bias=True)
+        self.extra = nn.ModuleList()
+        for _ in range(num_extra):
+            self.extra.append(nn.Sequential(
+                nn.Linear(n, n, bias=True),
+                nn.ReLU()
+            ))
+
+    def forward(self, x):
+        out = self.initial(x)
+        for layer in self.extra:
+            out = layer(out)
+        return out
+
+# -------------------- 训练与评估函数 --------------------
+def train_model(model, f_train, phi_train, f_test, phi_test, epochs, lr=1e-3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_loss = float('inf')
     best_state = None
     for ep in range(epochs):
         optimizer.zero_grad()
-        pred = model(c_train)
-        loss = torch.mean((pred - u_train) ** 2)
+        pred = model(f_train)
+        loss = torch.mean((pred - phi_train) ** 2)
         loss.backward()
         optimizer.step()
         with torch.no_grad():
-            test_loss = torch.mean((model(c_test) - u_test) ** 2)
+            test_loss = torch.mean((model(f_test) - phi_test) ** 2)
             if test_loss < best_loss:
                 best_loss = test_loss
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -148,113 +127,176 @@ def train_model(model, epochs, lr=1e-3):
         model.load_state_dict(best_state)
     return model
 
-def evaluate(model):
+def evaluate(model, f_test, phi_test):
+    model.eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
     with torch.no_grad():
-        pred = model(c_test)
-        return (torch.mean((pred - u_test) ** 2) / torch.mean(u_test ** 2)).item()
+        pred = model(f_test)
+        rel_error = (torch.mean((pred - phi_test) ** 2) / torch.mean(phi_test ** 2)).item()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    return rel_error, end - start
 
 def count_all_params(model):
     return sum(p.numel() for p in model.state_dict().values())
 
-# -------------------- 运行实验 --------------------
-def run_experiment(iterator_class, method_name, is_param=False):
-    """
-    非参数化 (is_param=False)：直接逐层展开，不训练，收集每层误差。
-    参数化 (is_param=True)：逐层展开，每添加一层后训练整个网络，收集训练后的误差。
-    返回 params_list, errors_list
-    """
-    print(f"\n===== Running {method_name} =====")
-    # 初始网络（需要训练）
-    initial_net = nn.Linear(n, n, bias=True).to(device)
-    initial_net = train_model(initial_net, epochs=epochs_init)
+# ==================== 1. 纯展开（固定CG） ====================
+initial_net_fixed = InitialNet(N).to(device)
+initial_net_fixed = train_model(initial_net_fixed, f_train, phi_train, f_test, phi_test,
+                                epochs=epochs_init, lr=lr)
 
-    if not is_param:
-        # 非参数化：纯展开
-        iterators = [iterator_class() for _ in range(K_iter)]
-        params, errors = [], []
-        for step in range(K_iter + 1):
-            model = GONModel(initial_net, iterators[:step]).to(device)
-            err = evaluate(model)
-            p = count_all_params(model)
-            params.append(p)
-            errors.append(err)
-            print(f"  step {step:2d}: params={p:6d}, error={err:.3e}")
-        return params, errors
+pure_errors = []
+pure_params = []
+pure_times = []
+
+for step in range(K_iter + 1):
+    steps = [CGStep(A_reg, trainable=False) for _ in range(step)]
+    model_pure = CGModel(initial_net_fixed, steps, A_reg, A_T).to(device)
+    err, elapsed = evaluate(model_pure, f_test, phi_test)
+    total_params = count_all_params(model_pure)
+    pure_errors.append(err)
+    pure_params.append(total_params)
+    pure_times.append(elapsed)
+    print(f"Pure CG step {step:2d}: params={total_params:6d}, error={err:.3e}, time={elapsed:.4f}s")
+
+pure_model_final = model_pure
+
+# ==================== 2. 展开+训练（可训练CG） ====================
+initial_net_train = InitialNet(N).to(device)
+initial_net_train = train_model(initial_net_train, f_train, phi_train, f_test, phi_test,
+                                epochs=epochs_init, lr=lr)
+
+trainable_steps = []
+model_train = CGModel(initial_net_train, trainable_steps, A_reg, A_T).to(device)
+train_errors = []
+train_params = []
+train_times = []
+
+for step in range(K_iter + 1):
+    if step == 0:
+        err, elapsed = evaluate(model_train, f_test, phi_test)
+        params = sum(p.numel() for p in model_train.parameters() if p.requires_grad)
+        print(f"Trainable CG step {step:2d}: params={params:6d}, error={err:.3e}, time={elapsed:.4f}s")
+        train_errors.append(err)
+        train_params.append(params)
+        train_times.append(elapsed)
     else:
-        # 参数化：逐层展开+训练
-        trainable_iters = []
-        model = GONModel(initial_net, trainable_iters).to(device)
-        params, errors = [], []
-        for step in range(K_iter + 1):
-            if step == 0:
-                err = evaluate(model)
-                p = count_all_params(model)
-            else:
-                new_it = iterator_class(trainable=True)
-                trainable_iters.append(new_it)
-                model = GONModel(initial_net, trainable_iters).to(device)
-                model = train_model(model, epochs=epochs_per_step)
-                err = evaluate(model)
-                p = count_all_params(model)
-            params.append(p)
-            errors.append(err)
-            print(f"  step {step:2d}: params={p:6d}, error={err:.3e}")
-        return params, errors
+        new_step = CGStep(A_reg, trainable=True)
+        trainable_steps.append(new_step)
+        model_train.steps.append(new_step)
+        model_train = train_model(model_train, f_train, phi_train, f_test, phi_test,
+                                  epochs=epochs_per_step, lr=lr)
+        err, elapsed = evaluate(model_train, f_test, phi_test)
+        params = sum(p.numel() for p in model_train.parameters() if p.requires_grad)
+        print(f"Trainable CG step {step:2d}: params={params:6d}, error={err:.3e}, time={elapsed:.4f}s")
+        train_errors.append(err)
+        train_params.append(params)
+        train_times.append(elapsed)
 
-# ==================== 定义所有方法 ====================
-methods = [
-    ("FixedPoint", FixedPointIterator, False),
-    ("ParamFixedPoint", ParamFixedPointIterator, True),
-    ("AnalyticNewton", AnalyticNewtonIterator, False),
-    ("ParamNewton", ParamNewtonIterator, True),
-    ("DiagonalSecantPure", DiagonalSecantIterator, False),
-    ("DiagonalSecant", DiagonalSecantIterator, True),
-]
+train_model_final = model_train
 
-all_results = {}
-for name, cls, is_param in methods:
-    params, errors = run_experiment(cls, name, is_param)
-    all_results[name] = (params, errors)
+# ==================== 3. Baseline 模型（逐层添加全连接层） ====================
+baseline_model = BaselineNet(N , num_extra=0).to(device)
+baseline_model = train_model(baseline_model, f_train, phi_train, f_test, phi_test,
+                             epochs=epochs_init, lr=lr)
 
-# 按方法类别分别取参考横坐标：
-# 1) 不动点类：FixedPoint / ParamFixedPoint
-# 2) 牛顿类：AnalyticNewton / ParamNewton
-# 3) 割线类：DiagonalSecantPure / DiagonalSecant
-reference_params = {
-    "FixedPoint": None,
-    "ParamFixedPoint": None,
-    "AnalyticNewton": None,
-    "ParamNewton": None,
-    "DiagonalSecantPure": None,
-    "DiagonalSecant": None,
-}
+baseline_params = []
+baseline_errors = []
+baseline_times = []
+current_extra = 0
 
-for name in reference_params.keys():
-    if name in all_results:
-        reference_params[name] = all_results[name][0]
+for step in range(K_iter + 1):
+    target_extra = step // 20
+    if target_extra > current_extra:
+        # 添加新层
+        for _ in range(target_extra - current_extra):
+            for _ in range(15):
+                new_layer = nn.Sequential(
+                    nn.Linear(N, N, bias=True),
+                    nn.ReLU()
+                    ).to(device)
+                baseline_model.extra.append(new_layer)
+        # 训练整个 baseline
+        baseline_model = train_model(baseline_model, f_train, phi_train, f_test, phi_test,
+                                     epochs=epochs_per_step, lr=lr)
+        current_extra = target_extra
+    err, elapsed = evaluate(baseline_model, f_test, phi_test)
+    params = count_all_params(baseline_model)
+    baseline_params.append(params)
+    baseline_errors.append(err)
+    baseline_times.append(elapsed)
+    print(f"Baseline step {step:2d}: params={params:6d}, error={err:.3e}, time={elapsed:.4f}s")
 
-# ==================== 绘图（6条线） ====================
-plt.figure(figsize=(12, 8))
-markers = ['o', 's', '^', 'D', 'v', 'p']
-colors = ['blue', 'cyan', 'red', 'magenta', 'green', 'orange']
-for i, (name, (params, errors)) in enumerate(all_results.items()):
-    if name in ["FixedPoint", "ParamFixedPoint"]:
-        x_vals = reference_params["ParamFixedPoint"]
-    elif name in ["AnalyticNewton", "ParamNewton"]:
-        x_vals = reference_params["ParamNewton"]
-    elif name in ["DiagonalSecantPure", "DiagonalSecant"]:
-        x_vals = reference_params["DiagonalSecant"]
-    else:
-        x_vals = params
+# ==================== 最终参数变化统计（只统计可训练CG层的α和β） ====================
+all_alphas = []
+all_betas = []
+for step_module in train_model_final.steps:
+    if hasattr(step_module, 'alpha') and step_module.alpha.requires_grad:
+        all_alphas.append(step_module.alpha.data.view(-1))
+    if hasattr(step_module, 'beta') and step_module.beta.requires_grad:
+        all_betas.append(step_module.beta.data.view(-1))
 
-    plt.semilogy(x_vals, errors, marker=markers[i], linestyle='-', color=colors[i],
-                 label=name, linewidth=2)
+if all_alphas or all_betas:
+    all_alphas = torch.cat(all_alphas) if all_alphas else torch.tensor([], device=device)
+    all_betas = torch.cat(all_betas) if all_betas else torch.tensor([], device=device)
+    diff_alpha = torch.max(torch.abs(all_alphas - 1.0)) if all_alphas.numel() > 0 else torch.tensor(0.0)
+    diff_beta  = torch.max(torch.abs(all_betas - 0.0)) if all_betas.numel() > 0 else torch.tensor(0.0)
+    total_inf_diff = max(diff_alpha.item(), diff_beta.item())
+    mean_alpha = all_alphas.mean().item() if all_alphas.numel() > 0 else 0.0
+    std_alpha  = all_alphas.std().item() if all_alphas.numel() > 0 else 0.0
+    mean_beta  = all_betas.mean().item() if all_betas.numel() > 0 else 0.0
+    std_beta   = all_betas.std().item() if all_betas.numel() > 0 else 0.0
+else:
+    total_inf_diff = 0.0
+    mean_alpha = mean_beta = std_alpha = std_beta = 0.0
 
-plt.xlabel('Total Parameters', fontsize=12)
-plt.ylabel('Relative Test MSE', fontsize=12)
+print("\n=== Final Trainable CG Parameters Change (vs Initial: alpha=1, beta=0) ===")
+print(f"Number of trainable CG layers: {len(train_model_final.steps)}")
+print(f"Infinity norm of parameter change (max absolute difference): {total_inf_diff:.3e}")
+print(f"Alpha stats: mean={mean_alpha:.3e}, std={std_alpha:.3e}")
+print(f"Beta stats:  mean={mean_beta:.3e}, std={std_beta:.3e}")
+
+# ==================== 绘制误差曲线（含 baseline） ====================
+plt.figure(figsize=(8, 6))
+plt.semilogy(pure_params, pure_errors, 'o-', label='CG pure unfolding')
+plt.semilogy(pure_params, train_errors, 's-', label='CG unroll + training')
+plt.semilogy(baseline_params, baseline_errors, 'd-', label='Baseline MLP', color='purple')
+plt.xlabel('Total Parameters')
+plt.ylabel('Relative Test MSE')
 plt.grid(True, which='both', linestyle='--', alpha=0.6)
-plt.legend(fontsize=10, ncol=2)
+plt.legend()
 plt.tight_layout()
-plt.savefig('gon_six_curves_correct.png', dpi=300)
+plt.savefig('integral_equation_CG.png', dpi=300)
 plt.show()
-print("Done. Plot saved as 'gon_six_curves_correct.png'")
+print("Error plot saved as 'integral_equation_CG.png'")
+
+# -------------------- 绘制单样本对比（可选） --------------------
+def plot_solution_comparison(pure_model, train_model, f_test, phi_test, x, device):
+    f_sample = f_test[0:1]
+    phi_true = phi_test[0]
+    with torch.no_grad():
+        phi_pure = pure_model(f_sample).squeeze(0)
+        phi_train = train_model(f_sample).squeeze(0)
+    x_np = x.cpu().numpy()
+    phi_true_np = phi_true.cpu().numpy()
+    phi_pure_np = phi_pure.cpu().numpy()
+    phi_train_np = phi_train.cpu().numpy()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x_np, phi_true_np, 'k-', lw=2, label='True φ')
+    plt.plot(x_np, phi_pure_np, 'r--', lw=1.5, label='Pure CG')
+    plt.plot(x_np, phi_train_np, 'b-.', lw=1.5, label='Trainable CG')
+    plt.xlabel('y')
+    plt.ylabel('φ(y)')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.title('Comparison of Recovered Solutions')
+    plt.tight_layout()
+    plt.savefig('solution_comparison_CG.png', dpi=150)
+    plt.show()
+    print("Solution comparison saved as 'solution_comparison_CG.png'")
+
+# plot_solution_comparison(pure_model_final, train_model_final, f_test, phi_test, x, device)
