@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import time
 
 # -------------------- 参数 --------------------
 n = 32
@@ -35,7 +36,6 @@ def compute_residual(c, u):
     return u - c - eps * torch.sin(shift(u))
 
 # ==================== 迭代器类 ====================
-# 1. 固定不动点（无参数）
 class FixedPointIterator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -43,9 +43,8 @@ class FixedPointIterator(nn.Module):
 
     def forward(self, c, u):
         G = c + self.eps * torch.sin(shift(u))
-        return G  # alpha=1
+        return G
 
-# 2. 参数化不动点（可训练 eps_param）
 class ParamFixedPointIterator(nn.Module):
     def __init__(self, trainable=False):
         super().__init__()
@@ -58,7 +57,6 @@ class ParamFixedPointIterator(nn.Module):
         eps_i = self.eps_param.unsqueeze(0)
         return c + eps_i * torch.sin(shift(u))
 
-# 3. 固定解析牛顿（无参数）
 class AnalyticNewtonIterator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -75,7 +73,6 @@ class AnalyticNewtonIterator(nn.Module):
         delta = torch.linalg.solve(J, -F.unsqueeze(-1)).squeeze(-1)
         return u + delta
 
-# 4. 参数化牛顿（可训练 diag, offdiag）
 class ParamNewtonIterator(nn.Module):
     def __init__(self, trainable=False):
         super().__init__()
@@ -97,10 +94,6 @@ class ParamNewtonIterator(nn.Module):
         delta = torch.linalg.solve(J, -F.unsqueeze(-1)).squeeze(-1)
         return u + delta
 
-# 5. 固定离散牛顿（无参数）
-# 已删除，改为使用纯展开的对角割线法（见第 6 部分）
-
-# 6. 对角割线法（可训练 inv_diag, rho）
 class DiagonalSecantIterator(nn.Module):
     def __init__(self, trainable=False):
         super().__init__()
@@ -149,59 +142,108 @@ def train_model(model, epochs, lr=1e-3):
     return model
 
 def evaluate(model):
+    model.eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
     with torch.no_grad():
         pred = model(c_test)
-        return (torch.mean((pred - u_test) ** 2) / torch.mean(u_test ** 2)).item()
+        rel_error = (torch.mean((pred - u_test) ** 2) / torch.mean(u_test ** 2)).item()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    return rel_error, end - start
 
 def count_all_params(model):
     return sum(p.numel() for p in model.state_dict().values())
 
-# -------------------- 运行实验 --------------------
+# ==================== Baseline 模型（多层全连接 + ReLU） ====================
+class BaselineNet(nn.Module):
+    def __init__(self, dim, num_extra=0):
+        super().__init__()
+        self.initial = nn.Linear(dim, dim, bias=True)
+        self.extra = nn.ModuleList()
+        for _ in range(num_extra):
+            self.extra.append(nn.Sequential(
+                nn.Linear(dim, dim, bias=True),
+                nn.ReLU()
+            ))
+
+    def forward(self, x):
+        out = self.initial(x)
+        for layer in self.extra:
+            out = layer(out)
+        return out
+
+# -------------------- 运行实验（原有方法） --------------------
 def run_experiment(iterator_class, method_name, is_param=False):
-    """
-    非参数化 (is_param=False)：直接逐层展开，不训练，收集每层误差。
-    参数化 (is_param=True)：逐层展开，每添加一层后训练整个网络，收集训练后的误差。
-    返回 params_list, errors_list
-    """
     print(f"\n===== Running {method_name} =====")
-    # 初始网络（需要训练）
     initial_net = nn.Linear(n, n, bias=True).to(device)
     initial_net = train_model(initial_net, epochs=epochs_init)
 
     if not is_param:
-        # 非参数化：纯展开
         iterators = [iterator_class() for _ in range(K_iter)]
-        params, errors = [], []
+        params, errors, times = [], [], []
         for step in range(K_iter + 1):
             model = GONModel(initial_net, iterators[:step]).to(device)
-            err = evaluate(model)
+            err, elapsed = evaluate(model)
             p = count_all_params(model)
             params.append(p)
             errors.append(err)
-            print(f"  step {step:2d}: params={p:6d}, error={err:.3e}")
-        return params, errors
+            times.append(elapsed)
+            print(f"  step {step:2d}: params={p:6d}, error={err:.3e}, time={elapsed:.4f}s")
+        return params, errors, times, None
     else:
-        # 参数化：逐层展开+训练
         trainable_iters = []
         model = GONModel(initial_net, trainable_iters).to(device)
-        params, errors = [], []
+        params, errors, times = [], [], []
+        initial_param_values = []
         for step in range(K_iter + 1):
             if step == 0:
-                err = evaluate(model)
+                err, elapsed = evaluate(model)
                 p = count_all_params(model)
+                params.append(p)
+                errors.append(err)
+                times.append(elapsed)
+                print(f"  step {step:2d}: params={p:6d}, error={err:.3e}, time={elapsed:.4f}s")
             else:
                 new_it = iterator_class(trainable=True)
+                for name, param in new_it.named_parameters():
+                    initial_param_values.append((name, param.data.clone()))
                 trainable_iters.append(new_it)
                 model = GONModel(initial_net, trainable_iters).to(device)
                 model = train_model(model, epochs=epochs_per_step)
-                err = evaluate(model)
+                err, elapsed = evaluate(model)
                 p = count_all_params(model)
-            params.append(p)
-            errors.append(err)
-            print(f"  step {step:2d}: params={p:6d}, error={err:.3e}")
-        return params, errors
+                params.append(p)
+                errors.append(err)
+                times.append(elapsed)
+                print(f"  step {step:2d}: params={p:6d}, error={err:.3e}, time={elapsed:.4f}s")
 
-# ==================== 定义所有方法 ====================
+        all_diffs = []
+        for name, init_val in initial_param_values:
+            found = False
+            for it in model.iterators:
+                if hasattr(it, name):
+                    curr = getattr(it, name)
+                    if curr is not None and curr.requires_grad:
+                        diff = torch.max(torch.abs(curr.data - init_val)).item()
+                        all_diffs.append(diff)
+                        found = True
+                        break
+            if not found:
+                print(f"Warning: parameter '{name}' not found in final model")
+        if all_diffs:
+            max_diff = max(all_diffs)
+            mean_diff = sum(all_diffs) / len(all_diffs)
+            print(f"  Parameter change (inf norm) for {method_name}: max={max_diff:.3e}, mean={mean_diff:.3e}")
+        else:
+            max_diff = 0.0
+            mean_diff = 0.0
+        diff_info = {'max': max_diff, 'mean': mean_diff, 'all': all_diffs}
+        return params, errors, times, diff_info
+
+# ==================== 运行所有已有方法 ====================
 methods = [
     ("FixedPoint", FixedPointIterator, False),
     ("ParamFixedPoint", ParamFixedPointIterator, True),
@@ -213,13 +255,47 @@ methods = [
 
 all_results = {}
 for name, cls, is_param in methods:
-    params, errors = run_experiment(cls, name, is_param)
-    all_results[name] = (params, errors)
+    params, errors, times, diff = run_experiment(cls, name, is_param)
+    all_results[name] = (params, errors, times, diff)
 
-# 按方法类别分别取参考横坐标：
-# 1) 不动点类：FixedPoint / ParamFixedPoint
-# 2) 牛顿类：AnalyticNewton / ParamNewton
-# 3) 割线类：DiagonalSecantPure / DiagonalSecant
+# ==================== 运行 Baseline 模型 ====================
+print("\n===== Running Baseline =====")
+baseline_model = BaselineNet(n, num_extra=0).to(device)
+baseline_model = train_model(baseline_model, epochs=epochs_init)
+
+baseline_params = []
+baseline_errors = []
+baseline_times = []
+current_extra = 0
+
+for step in range(K_iter + 1):
+    target_extra = step  # 每增加一个迭代器，baseline 增加一层
+    if target_extra > current_extra:
+        for _ in range(target_extra - current_extra):
+            new_layer = nn.Sequential(
+                nn.Linear(n, n, bias=True),
+                nn.ReLU()
+            ).to(device)
+            baseline_model.extra.append(new_layer)
+        baseline_model = train_model(baseline_model, epochs=epochs_per_step)
+        current_extra = target_extra
+    err, elapsed = evaluate(baseline_model)
+    p = count_all_params(baseline_model)
+    baseline_params.append(p)
+    baseline_errors.append(err)
+    baseline_times.append(elapsed)
+    print(f"  step {step:2d}: params={p:6d}, error={err:.3e}, time={elapsed:.4f}s")
+
+# 将 baseline 加入结果字典（方便绘图）
+all_results["Baseline"] = (baseline_params, baseline_errors, baseline_times, None)
+
+# 打印参数变化摘要
+print("\n===== Parameter Change Summary (for trainable models) =====")
+for name, (_, _, _, diff) in all_results.items():
+    if diff is not None:
+        print(f"{name:20s}: max inf-norm diff = {diff['max']:.3e}, mean = {diff['mean']:.3e}")
+
+# ==================== 绘图（7条曲线） ====================
 reference_params = {
     "FixedPoint": None,
     "ParamFixedPoint": None,
@@ -227,17 +303,17 @@ reference_params = {
     "ParamNewton": None,
     "DiagonalSecantPure": None,
     "DiagonalSecant": None,
+    "Baseline": None,
 }
 
 for name in reference_params.keys():
     if name in all_results:
         reference_params[name] = all_results[name][0]
 
-# ==================== 绘图（6条线） ====================
 plt.figure(figsize=(12, 8))
-markers = ['o', 's', '^', 'D', 'v', 'p']
-colors = ['blue', 'cyan', 'red', 'magenta', 'green', 'orange']
-for i, (name, (params, errors)) in enumerate(all_results.items()):
+markers = ['o', 's', '^', 'D', 'v', 'p', '*']
+colors = ['blue', 'cyan', 'red', 'magenta', 'green', 'orange', 'purple']
+for i, (name, (params, errors, times, diff)) in enumerate(all_results.items()):
     if name in ["FixedPoint", "ParamFixedPoint"]:
         x_vals = reference_params["ParamFixedPoint"]
     elif name in ["AnalyticNewton", "ParamNewton"]:
@@ -245,7 +321,7 @@ for i, (name, (params, errors)) in enumerate(all_results.items()):
     elif name in ["DiagonalSecantPure", "DiagonalSecant"]:
         x_vals = reference_params["DiagonalSecant"]
     else:
-        x_vals = params
+        x_vals = params  # Baseline 直接用自己的 params
 
     plt.semilogy(x_vals, errors, marker=markers[i], linestyle='-', color=colors[i],
                  label=name, linewidth=2)
